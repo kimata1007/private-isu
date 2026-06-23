@@ -96,6 +96,42 @@ func bumpPageVersion() {
 	atomic.AddInt64(&pageVersion, 1)
 }
 
+// 投稿一覧 HTML のインプロセスキャッシュ。読みは atomic ポインタでロックフリー、
+// 再構築は singleflight 用の mutex で1回だけ行う（サンダリングハード回避）。
+type idxCacheEntry struct {
+	ver  int64
+	html string
+}
+
+var (
+	idxCachePtr       atomic.Pointer[idxCacheEntry]
+	idxCacheRebuildMu sync.Mutex
+)
+
+// indexPostsHTML は投稿一覧 HTML（CSRF はプレースホルダ）をバージョンキャッシュから返す。
+func indexPostsHTML(ctx context.Context) (string, error) {
+	ver := atomic.LoadInt64(&pageVersion)
+	if c := idxCachePtr.Load(); c != nil && c.ver == ver {
+		return c.html, nil // ロックフリーの高速パス
+	}
+	idxCacheRebuildMu.Lock()
+	defer idxCacheRebuildMu.Unlock()
+	if c := idxCachePtr.Load(); c != nil && c.ver == ver { // 二重チェック
+		return c.html, nil
+	}
+	results := []Post{}
+	if err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) ORDER BY `created_at` DESC LIMIT ?", postsFetchMargin); err != nil {
+		return "", err
+	}
+	posts, err := makePosts(ctx, results, csrfPlaceholder, false)
+	if err != nil {
+		return "", err
+	}
+	html := string(renderPosts(posts))
+	idxCachePtr.Store(&idxCacheEntry{ver: ver, html: html})
+	return html, nil
+}
+
 // userCache は users を id -> User でインメモリ保持する。ユーザは約1000件と少なく
 // 更新も稀（登録・BAN・initialize のみ）なので、毎リクエストの SELECT users を消せる。
 // 整合性は、BAN/initialize で該当エントリを無効化することで担保する。
@@ -702,26 +738,13 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	// 全ユーザ共通の投稿一覧 HTML をバージョン付きでキャッシュする。CSRF はプレース
 	// ホルダで描画しておき、配信時にリクエストの CSRF トークンへ置換する。これで
 	// 大半の GET / が DB/描画を行わず、キャッシュ済みバイト列の置換だけで応答できる。
-	ver := atomic.LoadInt64(&pageVersion)
-	key := "idxlist:" + strconv.FormatInt(ver, 10)
-	var postsHTML string
-	if it, gerr := memcacheClient.Get(key); gerr == nil {
-		postsHTML = string(it.Value)
-	} else {
-		results := []Post{}
-		if err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) ORDER BY `created_at` DESC LIMIT ?", postsFetchMargin); err != nil {
-			log.Print(err)
-			return
-		}
-		posts, err := makePosts(ctx, results, csrfPlaceholder, false)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-		postsHTML = string(renderPosts(posts))
-		memcacheClient.Set(&memcache.Item{Key: key, Value: []byte(postsHTML)})
+	cached, err := indexPostsHTML(ctx)
+	if err != nil {
+		log.Print(err)
+		return
 	}
-	postsHTML = strings.ReplaceAll(postsHTML, csrfPlaceholder, csrf)
+	// 配信時にリクエストの CSRF トークンへ置換する。
+	postsHTML := strings.ReplaceAll(cached, csrfPlaceholder, csrf)
 
 	tmplIndex.Execute(w, struct {
 		PostsHTML template.HTML
