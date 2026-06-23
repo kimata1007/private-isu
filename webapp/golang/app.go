@@ -108,6 +108,10 @@ var (
 	idxCacheRebuildMu sync.Mutex
 )
 
+// postPageCache は /posts/:id の描画済み本文 HTML（CSRF はプレースホルダ）を
+// post_id 単位でキャッシュする。コメント追加でその投稿のみ無効化、BAN/initialize で全消去。
+var postPageCache sync.Map // map[int]string
+
 // indexPostsHTML は投稿一覧 HTML（CSRF はプレースホルダ）をバージョンキャッシュから返す。
 func indexPostsHTML(ctx context.Context) (string, error) {
 	ver := atomic.LoadInt64(&pageVersion)
@@ -614,6 +618,7 @@ func getInitialize(w http.ResponseWriter, r *http.Request) {
 	})
 	// 描画済みコメント HTML キャッシュ（およびセッション）も初期化のため flush する。
 	memcacheClient.FlushAll()
+	postPageCache.Range(func(k, _ any) bool { postPageCache.Delete(k); return true })
 	bumpPageVersion() // 一覧キャッシュも世代を上げて無効化する
 	w.WriteHeader(http.StatusOK)
 }
@@ -870,32 +875,37 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	posts, err := makePosts(ctx, results, getCSRFToken(r), true)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	if len(posts) == 0 {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	p := posts[0]
-
+	csrf := getCSRFToken(r)
 	me := getSessionUser(r)
 
+	// 投稿本文 HTML（全コメント込み、CSRF はプレースホルダ）を post_id 単位でキャッシュ。
+	var bodyHTML string
+	if v, ok := postPageCache.Load(pid); ok {
+		bodyHTML = v.(string)
+	} else {
+		results := []Post{}
+		if err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `id` = ?", pid); err != nil {
+			log.Print(err)
+			return
+		}
+		posts, err := makePosts(ctx, results, csrfPlaceholder, true)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		if len(posts) == 0 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		bodyHTML = string(renderPost(posts[0]))
+		postPageCache.Store(pid, bodyHTML)
+	}
+	bodyHTML = strings.ReplaceAll(bodyHTML, csrfPlaceholder, csrf)
+
 	tmplPostID.Execute(w, struct {
-		Post Post
-		Me   User
-	}{p, me})
+		PostHTML template.HTML
+		Me       User
+	}{template.HTML(bodyHTML), me})
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
@@ -1041,8 +1051,9 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	if _, err := db.ExecContext(ctx, "UPDATE `posts` SET `comment_count` = `comment_count` + 1 WHERE `id` = ?", postID); err != nil {
 		log.Print(err)
 	}
-	// この投稿の描画済みコメント HTML キャッシュを無効化（次の取得で作り直す）。
+	// この投稿の描画済みコメント HTML キャッシュ（一覧用）と詳細ページ本文キャッシュを無効化。
 	memcacheClient.Delete("chtml_" + strconv.Itoa(postID))
+	postPageCache.Delete(postID)
 	bumpPageVersion() // コメント追加で一覧の表示が変わるのでキャッシュ世代を上げる
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
@@ -1108,6 +1119,8 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 			userCache.Delete(n)
 		}
 	}
+	// BAN された投稿者の投稿は詳細でも 404 にすべきなので、詳細キャッシュを全消去する。
+	postPageCache.Range(func(k, _ any) bool { postPageCache.Delete(k); return true })
 	bumpPageVersion() // BAN で一覧から消える投稿があるのでキャッシュ世代を上げる
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
