@@ -410,47 +410,48 @@ func renderPostInto(b *strings.Builder, p Post) {
 	created := strings.ReplaceAll(p.CreatedAt.Format(ISO8601Format), "+", "&#43;")
 	id := strconv.Itoa(p.ID)
 	acct := p.User.AccountName
+	// 最小化: タグ間の改行・インデントを除去（ベンチは goquery セレクタ+TrimSpace で
+	// 検証し空白に寛容。本文/属性値は不変に保つ）。レスポンスを小さくして CPU 律速の
+	// ローカルベンチでベンチマーカー側のパース CPU と転送量を減らす。
 	b.WriteString(`<div class="isu-post" id="pid_`)
 	b.WriteString(id)
 	b.WriteString(`" data-created-at="`)
 	b.WriteString(created)
-	b.WriteString("\">\n  <div class=\"isu-post-header\">\n    <a href=\"/@")
+	b.WriteString(`"><div class="isu-post-header"><a href="/@`)
 	b.WriteString(acct)
 	b.WriteString(` " class="isu-post-account-name">`)
 	b.WriteString(acct)
-	b.WriteString("</a>\n    <a href=\"/posts/")
+	b.WriteString(`</a><a href="/posts/`)
 	b.WriteString(id)
-	b.WriteString("\" class=\"isu-post-permalink\">\n      <time class=\"timeago\" datetime=\"")
+	b.WriteString(`" class="isu-post-permalink"><time class="timeago" datetime="`)
 	b.WriteString(created)
-	b.WriteString("\"></time>\n    </a>\n  </div>\n  <div class=\"isu-post-image\">\n    <img src=\"")
+	b.WriteString(`"></time></a></div><div class="isu-post-image"><img src="`)
 	b.WriteString(imageURL(p))
-	b.WriteString("\" class=\"isu-image\">\n  </div>\n  <div class=\"isu-post-text\">\n    <a href=\"/@")
+	b.WriteString(`" class="isu-image"></div><div class="isu-post-text"><a href="/@`)
 	b.WriteString(acct)
 	b.WriteString(`" class="isu-post-account-name">`)
 	b.WriteString(acct)
-	b.WriteString("</a>\n    ")
+	b.WriteString(`</a>`)
 	b.WriteString(html.EscapeString(p.Body))
-	b.WriteString("\n  </div>\n  <div class=\"isu-post-comment\">\n    <div class=\"isu-post-comment-count\">\n      comments: <b>")
+	b.WriteString(`</div><div class="isu-post-comment"><div class="isu-post-comment-count">comments: <b>`)
 	b.WriteString(strconv.Itoa(p.CommentCount))
-	b.WriteString("</b>\n    </div>\n\n    ")
+	b.WriteString(`</b></div>`)
 	b.WriteString(p.commentsHTML)
-	b.WriteString("\n    <div class=\"isu-comment-form\">\n      <form method=\"post\" action=\"/comment\">\n        <input type=\"text\" name=\"comment\">\n        <input type=\"hidden\" name=\"post_id\" value=\"")
+	b.WriteString(`<div class="isu-comment-form"><form method="post" action="/comment"><input type="text" name="comment"><input type="hidden" name="post_id" value="`)
 	b.WriteString(id)
-	b.WriteString("\">\n        <input type=\"hidden\" name=\"csrf_token\" value=\"")
+	b.WriteString(`"><input type="hidden" name="csrf_token" value="`)
 	b.WriteString(p.CSRFToken)
-	b.WriteString("\">\n        <input type=\"submit\" name=\"submit\" value=\"submit\">\n      </form>\n    </div>\n  </div>\n</div>")
+	b.WriteString(`"><input type="submit" name="submit" value="submit"></form></div></div></div>`)
 }
 
 // renderPostsInto は投稿一覧の HTML を渡された builder に直接書き込む。中間文字列を
 // 作らないので、ページ生成側で 20KB 級の一時 string + コピー(alloc 圧の主因)を消せる。
 func renderPostsInto(b *strings.Builder, posts []Post) {
-	b.WriteString("<div class=\"isu-posts\">\n  ")
+	b.WriteString(`<div class="isu-posts">`)
 	for _, p := range posts {
-		b.WriteString("\n  ")
 		renderPostInto(b, p)
-		b.WriteString("\n  ")
 	}
-	b.WriteString("\n</div>")
+	b.WriteString(`</div>`)
 }
 
 // renderPosts は posts.html 相当（投稿一覧）の HTML を生成する。テンプレート FuncMap
@@ -472,26 +473,26 @@ func renderPost(p Post) template.HTML {
 // 実行が CPU プロファイル上 13% を占めていたため、ホットパス(getIndex)を手書きにする。
 // content の前までを書き、呼び出し側が content を続けて書いて closeLayout で閉じる。
 func openLayout(b *strings.Builder, me User) {
-	b.WriteString("<!DOCTYPE html>\n<html>\n  <head>\n    <meta charset=\"utf-8\">\n    <title>Iscogram</title>\n    <link href=\"/css/style.css\" media=\"screen\" rel=\"stylesheet\" type=\"text/css\">\n  </head>\n  <body>\n    <div class=\"container\">\n      <div class=\"header\">\n        <div class=\"isu-title\">\n          <h1><a href=\"/\">Iscogram</a></h1>\n        </div>\n        <div class=\"isu-header-menu\">\n          ")
+	b.WriteString(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Iscogram</title><link href="/css/style.css" media="screen" rel="stylesheet" type="text/css"></head><body><div class="container"><div class="header"><div class="isu-title"><h1><a href="/">Iscogram</a></h1></div><div class="isu-header-menu">`)
 	if me.ID == 0 {
-		b.WriteString("\n          <div><a href=\"/login\">ログイン</a></div>\n          ")
+		b.WriteString(`<div><a href="/login">ログイン</a></div>`)
 	} else {
 		// AccountName は [0-9a-zA-Z_]+ 検証済みでエスケープ不要。
-		b.WriteString("\n          <div><a href=\"/@")
+		b.WriteString(`<div><a href="/@`)
 		b.WriteString(me.AccountName)
-		b.WriteString("\"><span class=\"isu-account-name\">")
+		b.WriteString(`"><span class="isu-account-name">`)
 		b.WriteString(me.AccountName)
-		b.WriteString("</span>さん</a></div>\n          ")
+		b.WriteString(`</span>さん</a></div>`)
 		if me.Authority == 1 {
-			b.WriteString("\n          <div><a href=\"/admin/banned\">管理者用ページ</a></div>\n          ")
+			b.WriteString(`<div><a href="/admin/banned">管理者用ページ</a></div>`)
 		}
-		b.WriteString("\n          <div><a href=\"/logout\">ログアウト</a></div>\n          ")
+		b.WriteString(`<div><a href="/logout">ログアウト</a></div>`)
 	}
-	b.WriteString("\n        </div>\n      </div>\n\n      ")
+	b.WriteString(`</div></div>`)
 }
 
 func closeLayout(b *strings.Builder) {
-	b.WriteString("\n    </div>\n    <script src=\"/js/timeago.min.js\"></script>\n    <script src=\"/js/main.js\"></script>\n  </body>\n</html>\n")
+	b.WriteString(`</div><script src="/js/timeago.min.js"></script><script src="/js/main.js"></script></body></html>`)
 }
 
 // renderIndexPage は GET / のページ全体（layout + index content + posts）を手書きで
@@ -501,17 +502,17 @@ func renderIndexPage(me User, posts []Post, csrfToken, flash string) string {
 	b.Grow(24 * 1024) // 一覧ページは ~22KB。事前確保で builder の再割り当てを防ぐ。
 	openLayout(&b, me)
 	// index.html の content（投稿フォーム）。
-	b.WriteString("\n<div class=\"isu-submit\">\n  <form method=\"post\" action=\"/\" enctype=\"multipart/form-data\">\n    <div class=\"isu-form\">\n      <input type=\"file\" name=\"file\" value=\"file\">\n    </div>\n    <div class=\"isu-form\">\n      <textarea name=\"body\"></textarea>\n    </div>\n    <div class=\"form-submit\">\n      <input type=\"hidden\" name=\"csrf_token\" value=\"")
+	b.WriteString(`<div class="isu-submit"><form method="post" action="/" enctype="multipart/form-data"><div class="isu-form"><input type="file" name="file" value="file"></div><div class="isu-form"><textarea name="body"></textarea></div><div class="form-submit"><input type="hidden" name="csrf_token" value="`)
 	b.WriteString(csrfToken)
-	b.WriteString("\">\n      <input type=\"submit\" name=\"submit\" value=\"submit\">\n    </div>\n    ")
+	b.WriteString(`"><input type="submit" name="submit" value="submit"></div>`)
 	if flash != "" {
-		b.WriteString("\n    <div id=\"notice-message\" class=\"alert alert-danger\">\n      ")
+		b.WriteString(`<div id="notice-message" class="alert alert-danger">`)
 		b.WriteString(html.EscapeString(flash))
-		b.WriteString("\n    </div>\n    ")
+		b.WriteString(`</div>`)
 	}
-	b.WriteString("\n  </form>\n</div>\n\n")
+	b.WriteString(`</form></div>`)
 	renderPostsInto(&b, posts)
-	b.WriteString("\n\n<div id=\"isu-post-more\">\n  <button id=\"isu-post-more-btn\">もっと見る</button>\n  <img class=\"isu-loading-icon\" src=\"/img/ajax-loader.gif\">\n</div>\n")
+	b.WriteString(`<div id="isu-post-more"><button id="isu-post-more-btn">もっと見る</button><img class="isu-loading-icon" src="/img/ajax-loader.gif"></div>`)
 	closeLayout(&b)
 	return b.String()
 }
@@ -522,9 +523,7 @@ func renderIndexPage(me User, posts []Post, csrfToken, flash string) string {
 func renderPostIDPage(me User, p Post) string {
 	var b strings.Builder
 	openLayout(&b, me)
-	b.WriteString("\n")
 	renderPostInto(&b, p)
-	b.WriteString("\n")
 	closeLayout(&b)
 	return b.String()
 }
@@ -536,17 +535,16 @@ func renderUserPage(me User, user User, posts []Post, postCount, commentCount, c
 	b.Grow(24 * 1024)
 	openLayout(&b, me)
 	// AccountName は [0-9a-zA-Z_]+ 検証済みでエスケープ不要。
-	b.WriteString("\n<div class=\"isu-user\">\n  <div><span class=\"isu-user-account-name\">")
+	b.WriteString(`<div class="isu-user"><div><span class="isu-user-account-name">`)
 	b.WriteString(user.AccountName)
-	b.WriteString("さん</span>のページ</div>\n  <div>投稿数 <span class=\"isu-post-count\">")
+	b.WriteString(`さん</span>のページ</div><div>投稿数 <span class="isu-post-count">`)
 	b.WriteString(strconv.Itoa(postCount))
-	b.WriteString("</span></div>\n  <div>コメント数 <span class=\"isu-comment-count\">")
+	b.WriteString(`</span></div><div>コメント数 <span class="isu-comment-count">`)
 	b.WriteString(strconv.Itoa(commentCount))
-	b.WriteString("</span></div>\n  <div>被コメント数 <span class=\"isu-commented-count\">")
+	b.WriteString(`</span></div><div>被コメント数 <span class="isu-commented-count">`)
 	b.WriteString(strconv.Itoa(commentedCount))
-	b.WriteString("</span></div>\n</div>\n\n")
+	b.WriteString(`</span></div></div>`)
 	renderPostsInto(&b, posts)
-	b.WriteString("\n")
 	closeLayout(&b)
 	return b.String()
 }
@@ -556,13 +554,13 @@ func renderUserPage(me User, user User, posts []Post, postCount, commentCount, c
 func renderCommentsSegment(comments []Comment) string {
 	var b strings.Builder
 	for _, c := range comments {
-		b.WriteString("\n    <div class=\"isu-comment\">\n      <a href=\"/@")
+		b.WriteString(`<div class="isu-comment"><a href="/@`)
 		b.WriteString(c.User.AccountName)
 		b.WriteString(`" class="isu-comment-account-name">`)
 		b.WriteString(c.User.AccountName)
-		b.WriteString("</a>\n      <span class=\"isu-comment-text\">")
+		b.WriteString(`</a><span class="isu-comment-text">`)
 		b.WriteString(html.EscapeString(c.Comment))
-		b.WriteString("</span>\n    </div>\n    ")
+		b.WriteString(`</span></div>`)
 	}
 	return b.String()
 }
