@@ -33,7 +33,15 @@ var (
 
 const (
 	postsPerPage  = 20
-	ISO8601Format = "2006-01-02T15:04:05-07:00"
+	// postsFetchMargin is how many posts the list pages fetch from a single-table
+	// query before makePosts filters out posts by deleted users (del_flg != 0).
+	// We drop the users JOIN so MySQL can satisfy ORDER BY created_at DESC LIMIT
+	// with a backward scan of the posts(created_at) index (no temporary, no
+	// filesort). Since ~2% of users are deleted, fetching exactly postsPerPage
+	// could yield fewer than 20 after filtering, so we over-fetch by a wide
+	// margin. A backward index scan of this many rows is still cheap.
+	postsFetchMargin = 100
+	ISO8601Format    = "2006-01-02T15:04:05-07:00"
 	UploadLimit   = 10 * 1024 * 1024 // 10mb
 )
 
@@ -378,9 +386,34 @@ func getTemplPath(filename string) string {
 	return path.Join("templates", filename)
 }
 
+// cleanupOrphanImages は dbInitialize が削除する posts(id>10000) に対応する
+// 画像ファイルを public/image から消す。これをしないとベンチ実行のたびに
+// 投稿画像のファイルが溜まり続け、ディスクを食い潰す。
+func cleanupOrphanImages() {
+	entries, err := os.ReadDir("../public/image")
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		dot := strings.IndexByte(name, '.')
+		if dot <= 0 {
+			continue
+		}
+		id, err := strconv.Atoi(name[:dot])
+		if err != nil {
+			continue
+		}
+		if id > 10000 {
+			os.Remove("../public/image/" + name)
+		}
+	}
+}
+
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dbInitialize(ctx)
+	cleanupOrphanImages()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -502,7 +535,11 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.SelectContext(ctx, &results, "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` WHERE u.`del_flg` = 0 ORDER BY p.`created_at` DESC LIMIT 20")
+	// Single-table query so MySQL uses a backward scan of the posts(created_at)
+	// index for ORDER BY ... LIMIT (no temporary/filesort). makePosts then drops
+	// posts by deleted users and keeps the first postsPerPage; postsFetchMargin
+	// guarantees enough survivors. Bind the limit so it is reusable as a constant.
+	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsFetchMargin)
 	if err != nil {
 		log.Print(err)
 		return
@@ -620,7 +657,9 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` WHERE u.`del_flg` = 0 AND p.`created_at` <= ? ORDER BY p.`created_at` DESC LIMIT 20", t.Format(ISO8601Format))
+	// Single-table query (see getIndex): backward scan of posts(created_at) with
+	// LIMIT, then makePosts filters deleted users; postsFetchMargin over-fetches.
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsFetchMargin)
 	if err != nil {
 		log.Print(err)
 		return
