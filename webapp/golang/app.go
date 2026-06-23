@@ -87,6 +87,13 @@ var memcacheClient *memcache.Client
 // 整合性は、BAN/initialize で該当エントリを無効化することで担保する。
 var userCache sync.Map
 
+// userByName は del_flg=0 のユーザを account_name -> User で保持する。getAccountName の
+// `SELECT * FROM users WHERE account_name=?` が DB クエリ digest の最上位級(123万回)で、
+// ユーザは BAN 以外で不変なのでキャッシュで丸ごと消せる。BAN/initialize で全クリアして
+// 整合性を担保する(BAN は id 指定で name を持たないため、稀な操作として全消しする)。
+// ヒット(存在する del_flg=0 ユーザ)のみ格納し、ミス(404)はキャッシュしない。
+var userByName sync.Map
+
 // getUserByID はキャッシュ優先でユーザを取得し、無ければ DB から読んでキャッシュする。
 func getUserByID(ctx context.Context, id int) (User, bool) {
 	if v, ok := userCache.Load(id); ok {
@@ -299,6 +306,26 @@ func fetchComments(ctx context.Context, postIDs []int, allComments bool) (map[in
 	return res, nil
 }
 
+// selectPosts は posts の SELECT を手動 rows.Scan で実行する。sqlx.SelectContext の
+// reflection ベース scan(プロファイル上 scanAll が 13.7% CPU)を避ける。全 posts クエリは
+// id,user_id,body,mime,created_at,comment_count を同順で返すので共通化できる。
+func selectPosts(ctx context.Context, query string, args ...interface{}) ([]Post, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	posts := make([]Post, 0, postsFetchMargin)
+	for rows.Next() {
+		var p Post
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Body, &p.Mime, &p.CreatedAt, &p.CommentCount); err != nil {
+			return nil, err
+		}
+		posts = append(posts, p)
+	}
+	return posts, rows.Err()
+}
+
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	if len(results) == 0 {
 		return []Post{}, nil
@@ -414,16 +441,23 @@ func renderPostInto(b *strings.Builder, p Post) {
 	b.WriteString("\">\n        <input type=\"submit\" name=\"submit\" value=\"submit\">\n      </form>\n    </div>\n  </div>\n</div>")
 }
 
-// renderPosts は posts.html 相当（投稿一覧）の HTML を生成する。
-func renderPosts(posts []Post) template.HTML {
-	var b strings.Builder
+// renderPostsInto は投稿一覧の HTML を渡された builder に直接書き込む。中間文字列を
+// 作らないので、ページ生成側で 20KB 級の一時 string + コピー(alloc 圧の主因)を消せる。
+func renderPostsInto(b *strings.Builder, posts []Post) {
 	b.WriteString("<div class=\"isu-posts\">\n  ")
 	for _, p := range posts {
 		b.WriteString("\n  ")
-		renderPostInto(&b, p)
+		renderPostInto(b, p)
 		b.WriteString("\n  ")
 	}
 	b.WriteString("\n</div>")
+}
+
+// renderPosts は posts.html 相当（投稿一覧）の HTML を生成する。テンプレート FuncMap
+// および /posts フラグメント用に string を返す版。
+func renderPosts(posts []Post) template.HTML {
+	var b strings.Builder
+	renderPostsInto(&b, posts)
 	return template.HTML(b.String())
 }
 
@@ -464,6 +498,7 @@ func closeLayout(b *strings.Builder) {
 // 生成する。tmplIndex.Execute（html/template reflection）の置き換え。
 func renderIndexPage(me User, posts []Post, csrfToken, flash string) string {
 	var b strings.Builder
+	b.Grow(24 * 1024) // 一覧ページは ~22KB。事前確保で builder の再割り当てを防ぐ。
 	openLayout(&b, me)
 	// index.html の content（投稿フォーム）。
 	b.WriteString("\n<div class=\"isu-submit\">\n  <form method=\"post\" action=\"/\" enctype=\"multipart/form-data\">\n    <div class=\"isu-form\">\n      <input type=\"file\" name=\"file\" value=\"file\">\n    </div>\n    <div class=\"isu-form\">\n      <textarea name=\"body\"></textarea>\n    </div>\n    <div class=\"form-submit\">\n      <input type=\"hidden\" name=\"csrf_token\" value=\"")
@@ -475,7 +510,7 @@ func renderIndexPage(me User, posts []Post, csrfToken, flash string) string {
 		b.WriteString("\n    </div>\n    ")
 	}
 	b.WriteString("\n  </form>\n</div>\n\n")
-	b.WriteString(string(renderPosts(posts)))
+	renderPostsInto(&b, posts)
 	b.WriteString("\n\n<div id=\"isu-post-more\">\n  <button id=\"isu-post-more-btn\">もっと見る</button>\n  <img class=\"isu-loading-icon\" src=\"/img/ajax-loader.gif\">\n</div>\n")
 	closeLayout(&b)
 	return b.String()
@@ -498,6 +533,7 @@ func renderPostIDPage(me User, p Post) string {
 // 手書きで生成する。tmplUser.Execute の置き換え。
 func renderUserPage(me User, user User, posts []Post, postCount, commentCount, commentedCount int) string {
 	var b strings.Builder
+	b.Grow(24 * 1024)
 	openLayout(&b, me)
 	// AccountName は [0-9a-zA-Z_]+ 検証済みでエスケープ不要。
 	b.WriteString("\n<div class=\"isu-user\">\n  <div><span class=\"isu-user-account-name\">")
@@ -509,7 +545,7 @@ func renderUserPage(me User, user User, posts []Post, postCount, commentCount, c
 	b.WriteString("</span></div>\n  <div>被コメント数 <span class=\"isu-commented-count\">")
 	b.WriteString(strconv.Itoa(commentedCount))
 	b.WriteString("</span></div>\n</div>\n\n")
-	b.WriteString(string(renderPosts(posts)))
+	renderPostsInto(&b, posts)
 	b.WriteString("\n")
 	closeLayout(&b)
 	return b.String()
@@ -642,6 +678,10 @@ func getInitialize(w http.ResponseWriter, r *http.Request) {
 		userCache.Delete(k)
 		return true
 	})
+	userByName.Range(func(k, _ any) bool {
+		userByName.Delete(k)
+		return true
+	})
 	// 描画済みコメント HTML キャッシュ（およびセッション）も初期化のため flush する。
 	memcacheClient.FlushAll()
 	w.WriteHeader(http.StatusOK)
@@ -763,15 +803,13 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	me := getSessionUser(r)
 
-	results := []Post{}
-
 	// Single-table query so MySQL uses a backward scan of the posts(created_at)
 	// index for ORDER BY ... LIMIT (no temporary/filesort). makePosts then drops
 	// posts by deleted users and keeps the first postsPerPage; postsFetchMargin
 	// guarantees enough survivors. Bind the limit so it is reusable as a constant.
 	// FORCE INDEX: imgdata 削除でテーブルが小さくなった結果、optimizer が
 	// 全スキャン+filesort を誤って選ぶ。created_at index の backward scan を強制する。
-	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) ORDER BY `created_at` DESC LIMIT ?", postsFetchMargin)
+	results, err := selectPosts(ctx, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) ORDER BY `created_at` DESC LIMIT ?", postsFetchMargin)
 	if err != nil {
 		log.Print(err)
 		return
@@ -795,10 +833,18 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	accountName := r.PathValue("accountName")
 	user := User{}
 
-	err := db.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
-	if err != nil {
-		log.Print(err)
-		return
+	// account_name -> User の in-memory キャッシュ優先（DB digest 最上位の SELECT を消す）。
+	if v, ok := userByName.Load(accountName); ok {
+		user = v.(User)
+	} else {
+		err := db.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		if user.ID != 0 {
+			userByName.Store(accountName, user)
+		}
 	}
 
 	if user.ID == 0 {
@@ -806,9 +852,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := []Post{}
-
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20", user.ID)
+	results, err := selectPosts(ctx, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -869,10 +913,9 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := []Post{}
 	// Single-table query (see getIndex): backward scan of posts(created_at) with
 	// LIMIT, then makePosts filters deleted users; postsFetchMargin over-fetches.
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsFetchMargin)
+	results, err := selectPosts(ctx, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsFetchMargin)
 	if err != nil {
 		log.Print(err)
 		return
@@ -901,8 +944,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `id` = ?", pid)
+	results, err := selectPosts(ctx, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -1136,6 +1178,8 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 			userCache.Delete(n)
 		}
 	}
+	// userByName は account_name 起点で BAN 対象の name を持たないため全クリア（稀な操作）。
+	userByName.Range(func(k, _ any) bool { userByName.Delete(k); return true })
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
