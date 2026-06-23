@@ -1,0 +1,55 @@
+[mysqld]
+# ISUCON tuning for private-isu on AWS c6i.large (2 vCPU, 3.7 GiB RAM, no swap, NVMe-backed EBS).
+# Read-heavy workload (many small SELECTs) with moderate INSERTs (posts/comments).
+# DB shares the box with the app + nginx, so MySQL must NOT consume all RAM:
+# the ~1.3 GB of image files served by nginx benefit from OS page cache, and
+# the app process needs headroom too. All settings below are reboot-safe.
+
+# --- InnoDB buffer pool ---------------------------------------------------
+# Hold the hot working set (posts metadata, ~100k comments, 1000 users, and
+# their indexes = tens of MB) entirely in memory, with generous headroom for
+# growth and index churn. The posts table holds ~1.2 GB of image BLOBs, but the
+# app no longer SELECTs imgdata on hot paths (nginx serves images from files),
+# so we do NOT size the pool to fit the BLOBs. 1 GiB out of 3.7 GiB leaves
+# ~2.7 GiB for the app, nginx, the OS, and page cache for the image files.
+# Going to 3G+ would starve those and risk OOM on a swapless box.
+innodb_buffer_pool_size = 1G
+
+# --- Durability / commit flushing ----------------------------------------
+# DURABILITY TRADEOFF: value 2 writes the redo log to the OS on every commit
+# but only fsync()s to disk once per second. A clean OS reboot (contest
+# requirement) loses nothing because the OS flushes its buffers on shutdown.
+# Only an OS crash / power loss could lose up to ~1s of recent commits.
+# For this contest that tradeoff is acceptable and removes per-commit fsync,
+# the single biggest write-path win. (Default 1 = fully ACID, fsync per commit.)
+innodb_flush_log_at_trx_commit = 2
+
+# --- Flush method ---------------------------------------------------------
+# Open data files with O_DIRECT so InnoDB data/log I/O bypasses the OS page
+# cache, avoiding double-buffering (data cached once in the buffer pool instead
+# of twice). This frees OS page cache for the nginx-served image files.
+innodb_flush_method = O_DIRECT
+
+# --- Redo log capacity ----------------------------------------------------
+# Larger redo log = fewer, larger checkpoint flushes, smoothing write bursts
+# from INSERT spikes. innodb_redo_log_capacity is the MySQL 8.0.30+ knob that
+# supersedes innodb_log_file_size. 256M is comfortable for this write volume
+# and well within disk budget.
+innodb_redo_log_capacity = 256M
+
+# --- Binary log -----------------------------------------------------------
+# Disable the binary log to remove per-transaction binlog write + fsync
+# overhead. This is a single node with no replication, so the binlog only
+# adds cost. NOTE: this disables point-in-time recovery and replication, both
+# irrelevant here. Reboot-safe: InnoDB redo handles crash recovery on its own.
+skip-log-bin
+
+# --- Doublewrite buffer ----------------------------------------------------
+# Intentionally LEFT ON (default). Disabling it would risk torn-page
+# corruption on a crash, which conflicts with the contest's requirement to
+# survive a reboot cleanly. Not worth the small write saving — do NOT disable.
+
+# --- MyISAM key buffer -----------------------------------------------------
+# The schema is InnoDB; MyISAM key cache is near-useless here. Trimmed from
+# the 16M default to hand that RAM back to InnoDB / the OS.
+key_buffer_size = 8M
