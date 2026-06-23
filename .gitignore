@@ -1,0 +1,12 @@
+# build artifacts / deps (rebuildable)
+golang/app
+**/server.pid
+*.pid
+*.log
+php/vendor/
+node/node_modules/
+python/.venv/
+# local env (never commit secrets)
+env.sh
+*.pem
+*.key
