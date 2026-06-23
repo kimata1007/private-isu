@@ -468,6 +468,7 @@ func renderPostInto(b *strings.Builder, p Post) {
 // renderPosts は posts.html 相当（投稿一覧）の HTML を生成する。
 func renderPosts(posts []Post) template.HTML {
 	var b strings.Builder
+	b.Grow(8192) // バッファ倍化の memmove を避けるため先に確保
 	b.WriteString("<div class=\"isu-posts\">\n  ")
 	for _, p := range posts {
 		b.WriteString("\n  ")
@@ -481,6 +482,7 @@ func renderPosts(posts []Post) template.HTML {
 // renderPost は単一投稿（post_id.html 用）の HTML を生成する。
 func renderPost(p Post) template.HTML {
 	var b strings.Builder
+	b.Grow(4096)
 	renderPostInto(&b, p)
 	return template.HTML(b.String())
 }
