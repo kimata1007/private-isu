@@ -20,7 +20,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -83,55 +82,6 @@ type Comment struct {
 
 var memcacheClient *memcache.Client
 
-// pageVersion は投稿・コメント・BAN・initialize でインクリメントされ、
-// 描画済み一覧 HTML のキャッシュキーに使う（書き込みで世代を上げて無効化）。
-var pageVersion int64
-
-// csrfPlaceholder はキャッシュした一覧 HTML 内の CSRF トークンの差し替え用プレースホルダ。
-// 全ユーザ共通の一覧をキャッシュし、配信時にリクエスト毎の CSRF トークンへ置換する。
-// コンテンツに偶然含まれないよう起動時にランダム生成する。
-var csrfPlaceholder string
-
-func bumpPageVersion() {
-	atomic.AddInt64(&pageVersion, 1)
-}
-
-// 投稿一覧 HTML のインプロセスキャッシュ。読みは atomic ポインタでロックフリー、
-// 再構築は singleflight 用の mutex で1回だけ行う（サンダリングハード回避）。
-type idxCacheEntry struct {
-	ver  int64
-	html string
-}
-
-var (
-	idxCachePtr       atomic.Pointer[idxCacheEntry]
-	idxCacheRebuildMu sync.Mutex
-)
-
-// indexPostsHTML は投稿一覧 HTML（CSRF はプレースホルダ）をバージョンキャッシュから返す。
-func indexPostsHTML(ctx context.Context) (string, error) {
-	ver := atomic.LoadInt64(&pageVersion)
-	if c := idxCachePtr.Load(); c != nil && c.ver == ver {
-		return c.html, nil // ロックフリーの高速パス
-	}
-	idxCacheRebuildMu.Lock()
-	defer idxCacheRebuildMu.Unlock()
-	if c := idxCachePtr.Load(); c != nil && c.ver == ver { // 二重チェック
-		return c.html, nil
-	}
-	results := []Post{}
-	if err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) ORDER BY `created_at` DESC LIMIT ?", postsFetchMargin); err != nil {
-		return "", err
-	}
-	posts, err := makePosts(ctx, results, csrfPlaceholder, false)
-	if err != nil {
-		return "", err
-	}
-	html := string(renderPosts(posts))
-	idxCachePtr.Store(&idxCacheEntry{ver: ver, html: html})
-	return html, nil
-}
-
 // userCache は users を id -> User でインメモリ保持する。ユーザは約1000件と少なく
 // 更新も稀（登録・BAN・initialize のみ）なので、毎リクエストの SELECT users を消せる。
 // 整合性は、BAN/initialize で該当エントリを無効化することで担保する。
@@ -159,7 +109,6 @@ func init() {
 	}
 	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
-	csrfPlaceholder = "__CSRF_" + secureRandomStr(16) + "__"
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
 
@@ -468,7 +417,6 @@ func renderPostInto(b *strings.Builder, p Post) {
 // renderPosts は posts.html 相当（投稿一覧）の HTML を生成する。
 func renderPosts(posts []Post) template.HTML {
 	var b strings.Builder
-	b.Grow(8192) // バッファ倍化の memmove を避けるため先に確保
 	b.WriteString("<div class=\"isu-posts\">\n  ")
 	for _, p := range posts {
 		b.WriteString("\n  ")
@@ -482,7 +430,6 @@ func renderPosts(posts []Post) template.HTML {
 // renderPost は単一投稿（post_id.html 用）の HTML を生成する。
 func renderPost(p Post) template.HTML {
 	var b strings.Builder
-	b.Grow(4096)
 	renderPostInto(&b, p)
 	return template.HTML(b.String())
 }
@@ -616,7 +563,6 @@ func getInitialize(w http.ResponseWriter, r *http.Request) {
 	})
 	// 描画済みコメント HTML キャッシュ（およびセッション）も初期化のため flush する。
 	memcacheClient.FlushAll()
-	bumpPageVersion() // 一覧キャッシュも世代を上げて無効化する
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -735,25 +681,33 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	me := getSessionUser(r)
-	csrf := getCSRFToken(r)
 
-	// 全ユーザ共通の投稿一覧 HTML をバージョン付きでキャッシュする。CSRF はプレース
-	// ホルダで描画しておき、配信時にリクエストの CSRF トークンへ置換する。これで
-	// 大半の GET / が DB/描画を行わず、キャッシュ済みバイト列の置換だけで応答できる。
-	cached, err := indexPostsHTML(ctx)
+	results := []Post{}
+
+	// Single-table query so MySQL uses a backward scan of the posts(created_at)
+	// index for ORDER BY ... LIMIT (no temporary/filesort). makePosts then drops
+	// posts by deleted users and keeps the first postsPerPage; postsFetchMargin
+	// guarantees enough survivors. Bind the limit so it is reusable as a constant.
+	// FORCE INDEX: imgdata 削除でテーブルが小さくなった結果、optimizer が
+	// 全スキャン+filesort を誤って選ぶ。created_at index の backward scan を強制する。
+	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) ORDER BY `created_at` DESC LIMIT ?", postsFetchMargin)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-	// 配信時にリクエストの CSRF トークンへ置換する。
-	postsHTML := strings.ReplaceAll(cached, csrfPlaceholder, csrf)
+
+	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
+	if err != nil {
+		log.Print(err)
+		return
+	}
 
 	tmplIndex.Execute(w, struct {
-		PostsHTML template.HTML
+		Posts     []Post
 		Me        User
 		CSRFToken string
 		Flash     string
-	}{template.HTML(postsHTML), me, csrf, getFlash(w, r, "notice")})
+	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -989,7 +943,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
-	bumpPageVersion() // 新規投稿で一覧が変わるのでキャッシュ世代を上げる
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
@@ -1045,7 +998,6 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	}
 	// この投稿の描画済みコメント HTML キャッシュを無効化（次の取得で作り直す）。
 	memcacheClient.Delete("chtml_" + strconv.Itoa(postID))
-	bumpPageVersion() // コメント追加で一覧の表示が変わるのでキャッシュ世代を上げる
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
@@ -1110,7 +1062,6 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 			userCache.Delete(n)
 		}
 	}
-	bumpPageVersion() // BAN で一覧から消える投稿があるのでキャッシュ世代を上げる
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
