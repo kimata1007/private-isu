@@ -116,6 +116,11 @@ func init() {
 	}
 	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
+	// セッション値の memcached シリアライズを securecookie(gob) から JSON へ。gob は
+	// リクエスト毎にデコーダを再コンパイルし CPU プロファイル上 ~14% を占めていた。
+	// 値は user_id(int)/csrf_token(string)/notice(string) のみで JSON 化可能。
+	// JSON decode で user_id は float64 になるため getSessionUser で float64 を扱う。
+	store.StoreMethod = gsm.StoreMethodJson
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
 
@@ -198,6 +203,9 @@ func getSessionUser(r *http.Request) User {
 	case int:
 		id = v
 	case int64:
+		id = int(v)
+	case float64:
+		// StoreMethodJson では数値が float64 でデコードされる。
 		id = int(v)
 	default:
 		return User{}
