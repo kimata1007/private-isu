@@ -41,7 +41,7 @@ const (
 	// filesort). Since ~2% of users are deleted, fetching exactly postsPerPage
 	// could yield fewer than 20 after filtering, so we over-fetch by a wide
 	// margin. A backward index scan of this many rows is still cheap.
-	postsFetchMargin = 100
+	postsFetchMargin = 40
 	ISO8601Format    = "2006-01-02T15:04:05-07:00"
 	UploadLimit   = 10 * 1024 * 1024 // 10mb
 )
