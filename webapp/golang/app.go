@@ -434,6 +434,87 @@ func renderPost(p Post) template.HTML {
 	return template.HTML(b.String())
 }
 
+// layout.html の冒頭（DOCTYPE〜header）を直接書き出す。html/template の reflection
+// 実行が CPU プロファイル上 13% を占めていたため、ホットパス(getIndex)を手書きにする。
+// content の前までを書き、呼び出し側が content を続けて書いて closeLayout で閉じる。
+func openLayout(b *strings.Builder, me User) {
+	b.WriteString("<!DOCTYPE html>\n<html>\n  <head>\n    <meta charset=\"utf-8\">\n    <title>Iscogram</title>\n    <link href=\"/css/style.css\" media=\"screen\" rel=\"stylesheet\" type=\"text/css\">\n  </head>\n  <body>\n    <div class=\"container\">\n      <div class=\"header\">\n        <div class=\"isu-title\">\n          <h1><a href=\"/\">Iscogram</a></h1>\n        </div>\n        <div class=\"isu-header-menu\">\n          ")
+	if me.ID == 0 {
+		b.WriteString("\n          <div><a href=\"/login\">ログイン</a></div>\n          ")
+	} else {
+		// AccountName は [0-9a-zA-Z_]+ 検証済みでエスケープ不要。
+		b.WriteString("\n          <div><a href=\"/@")
+		b.WriteString(me.AccountName)
+		b.WriteString("\"><span class=\"isu-account-name\">")
+		b.WriteString(me.AccountName)
+		b.WriteString("</span>さん</a></div>\n          ")
+		if me.Authority == 1 {
+			b.WriteString("\n          <div><a href=\"/admin/banned\">管理者用ページ</a></div>\n          ")
+		}
+		b.WriteString("\n          <div><a href=\"/logout\">ログアウト</a></div>\n          ")
+	}
+	b.WriteString("\n        </div>\n      </div>\n\n      ")
+}
+
+func closeLayout(b *strings.Builder) {
+	b.WriteString("\n    </div>\n    <script src=\"/js/timeago.min.js\"></script>\n    <script src=\"/js/main.js\"></script>\n  </body>\n</html>\n")
+}
+
+// renderIndexPage は GET / のページ全体（layout + index content + posts）を手書きで
+// 生成する。tmplIndex.Execute（html/template reflection）の置き換え。
+func renderIndexPage(me User, posts []Post, csrfToken, flash string) string {
+	var b strings.Builder
+	openLayout(&b, me)
+	// index.html の content（投稿フォーム）。
+	b.WriteString("\n<div class=\"isu-submit\">\n  <form method=\"post\" action=\"/\" enctype=\"multipart/form-data\">\n    <div class=\"isu-form\">\n      <input type=\"file\" name=\"file\" value=\"file\">\n    </div>\n    <div class=\"isu-form\">\n      <textarea name=\"body\"></textarea>\n    </div>\n    <div class=\"form-submit\">\n      <input type=\"hidden\" name=\"csrf_token\" value=\"")
+	b.WriteString(csrfToken)
+	b.WriteString("\">\n      <input type=\"submit\" name=\"submit\" value=\"submit\">\n    </div>\n    ")
+	if flash != "" {
+		b.WriteString("\n    <div id=\"notice-message\" class=\"alert alert-danger\">\n      ")
+		b.WriteString(html.EscapeString(flash))
+		b.WriteString("\n    </div>\n    ")
+	}
+	b.WriteString("\n  </form>\n</div>\n\n")
+	b.WriteString(string(renderPosts(posts)))
+	b.WriteString("\n\n<div id=\"isu-post-more\">\n  <button id=\"isu-post-more-btn\">もっと見る</button>\n  <img class=\"isu-loading-icon\" src=\"/img/ajax-loader.gif\">\n</div>\n")
+	closeLayout(&b)
+	return b.String()
+}
+
+// renderPostIDPage は GET /posts/:id のページ全体（layout + post_id content）を
+// 手書きで生成する。tmplPostID.Execute の置き換え。post_id.html の content は
+// "\n{{ renderPost .Post }}\n"。
+func renderPostIDPage(me User, p Post) string {
+	var b strings.Builder
+	openLayout(&b, me)
+	b.WriteString("\n")
+	renderPostInto(&b, p)
+	b.WriteString("\n")
+	closeLayout(&b)
+	return b.String()
+}
+
+// renderUserPage は GET /@account のページ全体（layout + user.html content）を
+// 手書きで生成する。tmplUser.Execute の置き換え。
+func renderUserPage(me User, user User, posts []Post, postCount, commentCount, commentedCount int) string {
+	var b strings.Builder
+	openLayout(&b, me)
+	// AccountName は [0-9a-zA-Z_]+ 検証済みでエスケープ不要。
+	b.WriteString("\n<div class=\"isu-user\">\n  <div><span class=\"isu-user-account-name\">")
+	b.WriteString(user.AccountName)
+	b.WriteString("さん</span>のページ</div>\n  <div>投稿数 <span class=\"isu-post-count\">")
+	b.WriteString(strconv.Itoa(postCount))
+	b.WriteString("</span></div>\n  <div>コメント数 <span class=\"isu-comment-count\">")
+	b.WriteString(strconv.Itoa(commentCount))
+	b.WriteString("</span></div>\n  <div>被コメント数 <span class=\"isu-commented-count\">")
+	b.WriteString(strconv.Itoa(commentedCount))
+	b.WriteString("</span></div>\n</div>\n\n")
+	b.WriteString(string(renderPosts(posts)))
+	b.WriteString("\n")
+	closeLayout(&b)
+	return b.String()
+}
+
 // renderCommentsSegment は post.html のコメント部分（isu-comment divs）の HTML を
 // 生成する。renderPostInto が p.commentsHTML として挿入する。
 func renderCommentsSegment(comments []Comment) string {
@@ -696,18 +777,17 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
+	csrfToken := getCSRFToken(r)
+	posts, err := makePosts(ctx, results, csrfToken, false)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	tmplIndex.Execute(w, struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	// html/template の reflection 実行(プロファイル上 13% CPU)を避け、ページ全体を
+	// 手書きで生成して直接書き出す。
+	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+	io.WriteString(w, renderIndexPage(me, posts, csrfToken, getFlash(w, r, "notice")))
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -765,14 +845,9 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	tmplUser.Execute(w, struct {
-		Posts          []Post
-		User           User
-		PostCount      int
-		CommentCount   int
-		CommentedCount int
-		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	// html/template の reflection 実行を避け、手書きで生成して直接書き出す。
+	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+	io.WriteString(w, renderUserPage(me, user, posts, postCount, commentCount, commentedCount))
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -848,10 +923,9 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	tmplPostID.Execute(w, struct {
-		Post Post
-		Me   User
-	}{p, me})
+	// html/template の reflection 実行を避け、手書きで生成して直接書き出す。
+	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+	io.WriteString(w, renderPostIDPage(me, p))
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
