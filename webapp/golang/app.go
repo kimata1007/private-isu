@@ -1143,9 +1143,10 @@ func main() {
 	}
 	defer db.Close()
 
-	// 2 vCPU の MySQL に対して接続が殺到するとタイムアウトするため上限を設ける
-	db.SetMaxOpenConns(20)
-	db.SetMaxIdleConns(20)
+	// クエリが十分速くなり CPU に空きが出たため、コネクション上限を引き上げて
+	// 並行度を上げ、空いた CPU を使い切る（待ち行列で詰まらせない）。
+	db.SetMaxOpenConns(64)
+	db.SetMaxIdleConns(64)
 	db.SetConnMaxLifetime(0)
 
 	parseTemplates()
