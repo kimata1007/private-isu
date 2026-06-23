@@ -67,6 +67,7 @@ type Post struct {
 	Comments     []Comment
 	User         User
 	CSRFToken    string
+	commentsHTML string // 描画済みコメント divs（一覧用キャッシュ/詳細用に都度生成）
 }
 
 type Comment struct {
@@ -330,15 +331,25 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		return []Post{}, nil
 	}
 
-	// CommentCount は posts.comment_count（非正規化）から取得済みなので、
-	// ここではコメント本体だけまとめて取る。
-	commentsMap, err := fetchComments(ctx, postIDs, allComments)
-	if err != nil {
-		return nil, err
-	}
-
-	for i := range posts {
-		posts[i].Comments = commentsMap[posts[i].ID]
+	// CommentCount は posts.comment_count（非正規化）から取得済み。コメントは描画済み
+	// HTML として持たせる。一覧用（最新3件）は memcached(GetMulti) からまとめて取得、
+	// 詳細用（全件）は DB から取得して都度描画する。
+	if allComments {
+		commentsMap, err := fetchComments(ctx, postIDs, true)
+		if err != nil {
+			return nil, err
+		}
+		for i := range posts {
+			posts[i].commentsHTML = renderCommentsSegment(commentsMap[posts[i].ID])
+		}
+	} else {
+		htmlMap, err := commentsHTMLForPosts(ctx, postIDs)
+		if err != nil {
+			return nil, err
+		}
+		for i := range posts {
+			posts[i].commentsHTML = htmlMap[posts[i].ID]
+		}
 	}
 
 	return posts, nil
@@ -392,15 +403,7 @@ func renderPostInto(b *strings.Builder, p Post) {
 	b.WriteString("\n  </div>\n  <div class=\"isu-post-comment\">\n    <div class=\"isu-post-comment-count\">\n      comments: <b>")
 	b.WriteString(strconv.Itoa(p.CommentCount))
 	b.WriteString("</b>\n    </div>\n\n    ")
-	for _, c := range p.Comments {
-		b.WriteString("\n    <div class=\"isu-comment\">\n      <a href=\"/@")
-		b.WriteString(c.User.AccountName)
-		b.WriteString(`" class="isu-comment-account-name">`)
-		b.WriteString(c.User.AccountName)
-		b.WriteString("</a>\n      <span class=\"isu-comment-text\">")
-		b.WriteString(html.EscapeString(c.Comment))
-		b.WriteString("</span>\n    </div>\n    ")
-	}
+	b.WriteString(p.commentsHTML)
 	b.WriteString("\n    <div class=\"isu-comment-form\">\n      <form method=\"post\" action=\"/comment\">\n        <input type=\"text\" name=\"comment\">\n        <input type=\"hidden\" name=\"post_id\" value=\"")
 	b.WriteString(id)
 	b.WriteString("\">\n        <input type=\"hidden\" name=\"csrf_token\" value=\"")
@@ -426,6 +429,60 @@ func renderPost(p Post) template.HTML {
 	var b strings.Builder
 	renderPostInto(&b, p)
 	return template.HTML(b.String())
+}
+
+// renderCommentsSegment は post.html のコメント部分（isu-comment divs）の HTML を
+// 生成する。renderPostInto が p.commentsHTML として挿入する。
+func renderCommentsSegment(comments []Comment) string {
+	var b strings.Builder
+	for _, c := range comments {
+		b.WriteString("\n    <div class=\"isu-comment\">\n      <a href=\"/@")
+		b.WriteString(c.User.AccountName)
+		b.WriteString(`" class="isu-comment-account-name">`)
+		b.WriteString(c.User.AccountName)
+		b.WriteString("</a>\n      <span class=\"isu-comment-text\">")
+		b.WriteString(html.EscapeString(c.Comment))
+		b.WriteString("</span>\n    </div>\n    ")
+	}
+	return b.String()
+}
+
+// commentsHTMLForPosts は一覧表示用（最新3件）の描画済みコメント HTML を、
+// memcached から GetMulti で1往復取得する。最大の DB 負荷だった SELECT comments を
+// 消し、かつ描画コストも削減する。miss は DB から取得して描画・キャッシュする。
+func commentsHTMLForPosts(ctx context.Context, postIDs []int) (map[int]string, error) {
+	res := make(map[int]string, len(postIDs))
+	keys := make([]string, len(postIDs))
+	keyToID := make(map[string]int, len(postIDs))
+	for i, pid := range postIDs {
+		k := "chtml_" + strconv.Itoa(pid)
+		keys[i] = k
+		keyToID[k] = pid
+	}
+	items, err := memcacheClient.GetMulti(keys)
+	if err != nil {
+		items = nil // キャッシュ障害時は全件 miss 扱いで DB にフォールバック
+	}
+	var miss []int
+	for _, pid := range postIDs {
+		if it, ok := items["chtml_"+strconv.Itoa(pid)]; ok {
+			res[pid] = string(it.Value)
+		} else {
+			miss = append(miss, pid)
+		}
+	}
+	if len(miss) > 0 {
+		fetched, err := fetchComments(ctx, miss, false)
+		if err != nil {
+			return nil, err
+		}
+		for _, pid := range miss {
+			h := renderCommentsSegment(fetched[pid])
+			res[pid] = h
+			memcacheClient.Set(&memcache.Item{Key: "chtml_" + strconv.Itoa(pid), Value: []byte(h)})
+		}
+	}
+	return res, nil
 }
 
 // 画像を public/image 配下にファイルとして書き出す（nginx が静的配信できるようにする）。
@@ -501,6 +558,8 @@ func getInitialize(w http.ResponseWriter, r *http.Request) {
 		userCache.Delete(k)
 		return true
 	})
+	// 描画済みコメント HTML キャッシュ（およびセッション）も初期化のため flush する。
+	memcacheClient.FlushAll()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -934,6 +993,8 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	if _, err := db.ExecContext(ctx, "UPDATE `posts` SET `comment_count` = `comment_count` + 1 WHERE `id` = ?", postID); err != nil {
 		log.Print(err)
 	}
+	// この投稿の描画済みコメント HTML キャッシュを無効化（次の取得で作り直す）。
+	memcacheClient.Delete("chtml_" + strconv.Itoa(postID))
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
