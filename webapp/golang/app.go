@@ -495,12 +495,29 @@ func closeLayout(b *strings.Builder) {
 	b.WriteString(`</div><script src="/js/timeago.min.js"></script><script src="/js/main.js"></script></body></html>`)
 }
 
-// renderIndexPage は GET / のページ全体（layout + index content + posts）を手書きで
-// 生成する。tmplIndex.Execute（html/template reflection）の置き換え。
-func renderIndexPage(me User, posts []Post, csrfToken, flash string) string {
-	var b strings.Builder
-	b.Grow(24 * 1024) // 一覧ページは ~22KB。事前確保で builder の再割り当てを防ぐ。
-	openLayout(&b, me)
+// pageBufPool はページ生成用の strings.Builder を再利用する。ページ毎の 24KB バッファ
+// + String() コピー(mallocgc が CPU の ~12%)を削減する。ハンドラは build→w へ書き出し→
+// Reset して Put する。b.String() は書き出し完了後に Put するため安全(Put 後に他の goroutine
+// が Reset しても、こちらの書き出しは既に完了済み)。
+var pageBufPool = sync.Pool{New: func() any { b := new(strings.Builder); b.Grow(24 * 1024); return b }}
+
+func getPageBuf() *strings.Builder {
+	b := pageBufPool.Get().(*strings.Builder)
+	b.Reset()
+	return b
+}
+
+// writePage はページ HTML を w に書き出し、builder を pool に返す。
+func writePage(w http.ResponseWriter, b *strings.Builder) {
+	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+	io.WriteString(w, b.String())
+	pageBufPool.Put(b)
+}
+
+// renderIndexInto は GET / のページ全体（layout + index content + posts）を渡された
+// builder に手書きで書き込む。tmplIndex.Execute（html/template reflection）の置き換え。
+func renderIndexInto(b *strings.Builder, me User, posts []Post, csrfToken, flash string) {
+	openLayout(b, me)
 	// index.html の content（投稿フォーム）。
 	b.WriteString(`<div class="isu-submit"><form method="post" action="/" enctype="multipart/form-data"><div class="isu-form"><input type="file" name="file" value="file"></div><div class="isu-form"><textarea name="body"></textarea></div><div class="form-submit"><input type="hidden" name="csrf_token" value="`)
 	b.WriteString(csrfToken)
@@ -511,29 +528,24 @@ func renderIndexPage(me User, posts []Post, csrfToken, flash string) string {
 		b.WriteString(`</div>`)
 	}
 	b.WriteString(`</form></div>`)
-	renderPostsInto(&b, posts)
+	renderPostsInto(b, posts)
 	b.WriteString(`<div id="isu-post-more"><button id="isu-post-more-btn">もっと見る</button><img class="isu-loading-icon" src="/img/ajax-loader.gif"></div>`)
-	closeLayout(&b)
-	return b.String()
+	closeLayout(b)
 }
 
 // renderPostIDPage は GET /posts/:id のページ全体（layout + post_id content）を
 // 手書きで生成する。tmplPostID.Execute の置き換え。post_id.html の content は
 // "\n{{ renderPost .Post }}\n"。
-func renderPostIDPage(me User, p Post) string {
-	var b strings.Builder
-	openLayout(&b, me)
-	renderPostInto(&b, p)
-	closeLayout(&b)
-	return b.String()
+func renderPostIDInto(b *strings.Builder, me User, p Post) {
+	openLayout(b, me)
+	renderPostInto(b, p)
+	closeLayout(b)
 }
 
 // renderUserPage は GET /@account のページ全体（layout + user.html content）を
 // 手書きで生成する。tmplUser.Execute の置き換え。
-func renderUserPage(me User, user User, posts []Post, postCount, commentCount, commentedCount int) string {
-	var b strings.Builder
-	b.Grow(24 * 1024)
-	openLayout(&b, me)
+func renderUserInto(b *strings.Builder, me User, user User, posts []Post, postCount, commentCount, commentedCount int) {
+	openLayout(b, me)
 	// AccountName は [0-9a-zA-Z_]+ 検証済みでエスケープ不要。
 	b.WriteString(`<div class="isu-user"><div><span class="isu-user-account-name">`)
 	b.WriteString(user.AccountName)
@@ -544,9 +556,8 @@ func renderUserPage(me User, user User, posts []Post, postCount, commentCount, c
 	b.WriteString(`</span></div><div>被コメント数 <span class="isu-commented-count">`)
 	b.WriteString(strconv.Itoa(commentedCount))
 	b.WriteString(`</span></div></div>`)
-	renderPostsInto(&b, posts)
-	closeLayout(&b)
-	return b.String()
+	renderPostsInto(b, posts)
+	closeLayout(b)
 }
 
 // renderCommentsSegment は post.html のコメント部分（isu-comment divs）の HTML を
@@ -821,9 +832,10 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// html/template の reflection 実行(プロファイル上 13% CPU)を避け、ページ全体を
-	// 手書きで生成して直接書き出す。
-	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
-	io.WriteString(w, renderIndexPage(me, posts, csrfToken, getFlash(w, r, "notice")))
+	// 手書きで生成して直接書き出す。builder は pool から再利用。
+	b := getPageBuf()
+	renderIndexInto(b, me, posts, csrfToken, getFlash(w, r, "notice"))
+	writePage(w, b)
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -888,8 +900,9 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
 	// html/template の reflection 実行を避け、手書きで生成して直接書き出す。
-	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
-	io.WriteString(w, renderUserPage(me, user, posts, postCount, commentCount, commentedCount))
+	b := getPageBuf()
+	renderUserInto(b, me, user, posts, postCount, commentCount, commentedCount)
+	writePage(w, b)
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -964,8 +977,9 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
 	// html/template の reflection 実行を避け、手書きで生成して直接書き出す。
-	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
-	io.WriteString(w, renderPostIDPage(me, p))
+	b := getPageBuf()
+	renderPostIDInto(b, me, p)
+	writePage(w, b)
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
