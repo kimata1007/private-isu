@@ -360,20 +360,17 @@ func imageURL(p Post) string {
 
 // 画像を public/image 配下にファイルとして書き出す（nginx が静的配信できるようにする）。
 // 一時ファイルに書いてから rename することで、配信中の半端なファイルを避ける。
-func writeImageFile(id int, mime string, data []byte) {
+func writeImageFile(id int, mime string, data []byte) error {
 	ext := imageExt(mime)
 	if ext == "" {
-		return
+		return fmt.Errorf("unknown mime: %s", mime)
 	}
 	dst := "../public/image/" + strconv.Itoa(id) + ext
 	tmp := dst + ".tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		log.Print(err)
-		return
+		return err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		log.Print(err)
-	}
+	return os.Rename(tmp, dst)
 }
 
 func isLogin(u User) bool {
@@ -783,29 +780,37 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 画像本体はファイルに書き出して nginx が配信するため DB には保存しない
-	// （imgdata カラムは削除済み）。
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)"
-	result, err := db.ExecContext(
-		ctx,
-		query,
-		me.ID,
-		mime,
-		r.FormValue("body"),
-	)
+	// 画像はファイル配信（imgdata カラムは削除済み）。
+	// 「投稿は可視だが画像ファイルが未生成」という窓を無くすため、トランザクション内で
+	// INSERT → ファイル書き出し → コミット の順にする。コミットするまで他コネクションから
+	// 投稿は見えないので、可視化された時点では必ず画像ファイルが存在する。
+	tx, err := db.BeginTxx(ctx, nil)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-
+	result, err := tx.ExecContext(ctx, "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)", me.ID, mime, r.FormValue("body"))
+	if err != nil {
+		tx.Rollback()
+		log.Print(err)
+		return
+	}
 	pid, err := result.LastInsertId()
 	if err != nil {
+		tx.Rollback()
 		log.Print(err)
 		return
 	}
-
-	// アップロード時点でファイルにも書き出し、GET /image を nginx 静的配信に乗せる
-	writeImageFile(int(pid), mime, filedata)
+	if err := writeImageFile(int(pid), mime, filedata); err != nil {
+		// ファイルが書けないなら投稿自体を作らない（DB とファイルの整合を保つ）。
+		tx.Rollback()
+		log.Print(err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Print(err)
+		return
+	}
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
