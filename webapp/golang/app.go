@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
+	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
 	"github.com/go-chi/chi/v5"
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
@@ -31,7 +32,7 @@ import (
 
 var (
 	db    *sqlx.DB
-	store *sessions.CookieStore
+	store *gsm.MemcacheStore
 )
 
 const (
@@ -107,9 +108,7 @@ func init() {
 		memdAddr = "/run/memcached/memcached.sock"
 	}
 	memcacheClient = memcache.New(memdAddr)
-	// セッションを Cookie ベース（署名付き、サーバー保存なし）にすることで、
-	// 毎リクエストで発生していたセッションの memcached 読み込み往復を無くす。
-	store = sessions.NewCookieStore([]byte("sendagaya"))
+	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
 
