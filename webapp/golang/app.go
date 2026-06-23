@@ -6,10 +6,12 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
+	"html"
 	"html/template"
 	"io"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"path"
@@ -356,6 +358,74 @@ func imageExt(mime string) string {
 
 func imageURL(p Post) string {
 	return "/image/" + strconv.Itoa(p.ID) + imageExt(p.Mime)
+}
+
+// renderPostInto は post.html 相当の HTML を直接組み立てる（html/template の
+// reflection 実行が最大の CPU 消費だったため、ホットパスを手書きに置換する）。
+// account_name は [0-9a-zA-Z_]+ に検証済みでエスケープ不要。本文・コメントは
+// 自由入力なので html.EscapeString で HTML エスケープする（html/template と同等）。
+func renderPostInto(b *strings.Builder, p Post) {
+	// html/template は属性値中の "+" を "&#43;" にエスケープするので、出力を一致させる。
+	created := strings.ReplaceAll(p.CreatedAt.Format(ISO8601Format), "+", "&#43;")
+	id := strconv.Itoa(p.ID)
+	acct := p.User.AccountName
+	b.WriteString(`<div class="isu-post" id="pid_`)
+	b.WriteString(id)
+	b.WriteString(`" data-created-at="`)
+	b.WriteString(created)
+	b.WriteString("\">\n  <div class=\"isu-post-header\">\n    <a href=\"/@")
+	b.WriteString(acct)
+	b.WriteString(` " class="isu-post-account-name">`)
+	b.WriteString(acct)
+	b.WriteString("</a>\n    <a href=\"/posts/")
+	b.WriteString(id)
+	b.WriteString("\" class=\"isu-post-permalink\">\n      <time class=\"timeago\" datetime=\"")
+	b.WriteString(created)
+	b.WriteString("\"></time>\n    </a>\n  </div>\n  <div class=\"isu-post-image\">\n    <img src=\"")
+	b.WriteString(imageURL(p))
+	b.WriteString("\" class=\"isu-image\">\n  </div>\n  <div class=\"isu-post-text\">\n    <a href=\"/@")
+	b.WriteString(acct)
+	b.WriteString(`" class="isu-post-account-name">`)
+	b.WriteString(acct)
+	b.WriteString("</a>\n    ")
+	b.WriteString(html.EscapeString(p.Body))
+	b.WriteString("\n  </div>\n  <div class=\"isu-post-comment\">\n    <div class=\"isu-post-comment-count\">\n      comments: <b>")
+	b.WriteString(strconv.Itoa(p.CommentCount))
+	b.WriteString("</b>\n    </div>\n\n    ")
+	for _, c := range p.Comments {
+		b.WriteString("\n    <div class=\"isu-comment\">\n      <a href=\"/@")
+		b.WriteString(c.User.AccountName)
+		b.WriteString(`" class="isu-comment-account-name">`)
+		b.WriteString(c.User.AccountName)
+		b.WriteString("</a>\n      <span class=\"isu-comment-text\">")
+		b.WriteString(html.EscapeString(c.Comment))
+		b.WriteString("</span>\n    </div>\n    ")
+	}
+	b.WriteString("\n    <div class=\"isu-comment-form\">\n      <form method=\"post\" action=\"/comment\">\n        <input type=\"text\" name=\"comment\">\n        <input type=\"hidden\" name=\"post_id\" value=\"")
+	b.WriteString(id)
+	b.WriteString("\">\n        <input type=\"hidden\" name=\"csrf_token\" value=\"")
+	b.WriteString(p.CSRFToken)
+	b.WriteString("\">\n        <input type=\"submit\" name=\"submit\" value=\"submit\">\n      </form>\n    </div>\n  </div>\n</div>")
+}
+
+// renderPosts は posts.html 相当（投稿一覧）の HTML を生成する。
+func renderPosts(posts []Post) template.HTML {
+	var b strings.Builder
+	b.WriteString("<div class=\"isu-posts\">\n  ")
+	for _, p := range posts {
+		b.WriteString("\n  ")
+		renderPostInto(&b, p)
+		b.WriteString("\n  ")
+	}
+	b.WriteString("\n</div>")
+	return template.HTML(b.String())
+}
+
+// renderPost は単一投稿（post_id.html 用）の HTML を生成する。
+func renderPost(p Post) template.HTML {
+	var b strings.Builder
+	renderPostInto(&b, p)
+	return template.HTML(b.String())
 }
 
 // 画像を public/image 配下にファイルとして書き出す（nginx が静的配信できるようにする）。
@@ -944,7 +1014,7 @@ var (
 
 // テンプレートは起動時に一度だけパースする（毎リクエストの再パースを避ける）。
 func parseTemplates() {
-	fmap := template.FuncMap{"imageURL": imageURL}
+	fmap := template.FuncMap{"imageURL": imageURL, "renderPosts": renderPosts, "renderPost": renderPost}
 	tmplIndex = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"), getTemplPath("index.html"), getTemplPath("posts.html"), getTemplPath("post.html")))
 	tmplPosts = template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
@@ -1010,6 +1080,9 @@ func main() {
 	db.SetConnMaxLifetime(0)
 
 	parseTemplates()
+
+	// プロファイル用（localhost のみ、計測時だけ使う）。
+	go func() { http.ListenAndServe("localhost:6060", nil) }()
 
 	r := chi.NewRouter()
 
