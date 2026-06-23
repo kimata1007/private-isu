@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
@@ -102,7 +103,9 @@ func getUserByID(ctx context.Context, id int) (User, bool) {
 func init() {
 	memdAddr := os.Getenv("ISUCONP_MEMCACHED_ADDRESS")
 	if memdAddr == "" {
-		memdAddr = "localhost:11211"
+		// 同一ホストの memcached へは Unix domain socket で繋ぎ、localhost TCP の
+		// スタック処理（softirq 含む）を削減する。
+		memdAddr = "/run/memcached/memcached.sock"
 	}
 	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
@@ -1118,8 +1121,13 @@ func main() {
 	cfg := mysql.NewConfig()
 	cfg.User = user
 	cfg.Passwd = password
-	cfg.Net = "tcp"
-	cfg.Addr = fmt.Sprintf("%s:%s", host, port)
+	if host == "localhost" {
+		cfg.Net = "unix"
+		cfg.Addr = "/var/run/mysqld/mysqld.sock"
+	} else {
+		cfg.Net = "tcp"
+		cfg.Addr = fmt.Sprintf("%s:%s", host, port)
+	}
 	cfg.DBName = dbname
 	cfg.Params = map[string]string{
 		"charset": "utf8mb4",
@@ -1164,5 +1172,15 @@ func main() {
 	r.Get(`/@{accountName:[0-9a-zA-Z_]+}`, getAccountName)
 	r.Mount("/", http.FileServer(http.Dir("../public")))
 
-	log.Fatal(http.ListenAndServe(":8080", r))
+	// nginx からは Unix domain socket で受ける（localhost TCP のスタック処理を削減）。
+	const sockPath = "/tmp/isu-go.sock"
+	os.Remove(sockPath)
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := os.Chmod(sockPath, 0777); err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(http.Serve(ln, r))
 }
