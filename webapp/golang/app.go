@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -57,11 +58,10 @@ type User struct {
 type Post struct {
 	ID           int       `db:"id"`
 	UserID       int       `db:"user_id"`
-	Imgdata      []byte    `db:"imgdata"`
 	Body         string    `db:"body"`
 	Mime         string    `db:"mime"`
 	CreatedAt    time.Time `db:"created_at"`
-	CommentCount int
+	CommentCount int       `db:"comment_count"`
 	Comments     []Comment
 	User         User
 	CSRFToken    string
@@ -77,6 +77,24 @@ type Comment struct {
 }
 
 var memcacheClient *memcache.Client
+
+// userCache は users を id -> User でインメモリ保持する。ユーザは約1000件と少なく
+// 更新も稀（登録・BAN・initialize のみ）なので、毎リクエストの SELECT users を消せる。
+// 整合性は、BAN/initialize で該当エントリを無効化することで担保する。
+var userCache sync.Map
+
+// getUserByID はキャッシュ優先でユーザを取得し、無ければ DB から読んでキャッシュする。
+func getUserByID(ctx context.Context, id int) (User, bool) {
+	if v, ok := userCache.Load(id); ok {
+		return v.(User), true
+	}
+	u := User{}
+	if err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", id); err != nil {
+		return User{}, false
+	}
+	userCache.Store(id, u)
+	return u, true
+}
 
 func init() {
 	memdAddr := os.Getenv("ISUCONP_MEMCACHED_ADDRESS")
@@ -95,6 +113,11 @@ func dbInitialize(ctx context.Context) {
 		"DELETE FROM comments WHERE id > 100000",
 		"UPDATE users SET del_flg = 0",
 		"UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
+		// 非正規化した comment_count を初期化後の状態に合わせて再計算する。
+		// 相関サブクエリは遅いので GROUP BY 集計を1回作って JOIN 更新する。
+		// WHERE で値が変わる行だけ更新する。posts は imgdata blob を含み1行が重いため、
+		// 全行書き換えると遅い。実際に変化するのは新規コメントが付いた少数の行だけ。
+		"UPDATE posts p LEFT JOIN (SELECT post_id, COUNT(*) cnt FROM comments GROUP BY post_id) c ON p.id = c.post_id SET p.comment_count = COALESCE(c.cnt, 0) WHERE p.comment_count <> COALESCE(c.cnt, 0)",
 	}
 
 	for _, sql := range sqls {
@@ -157,13 +180,17 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
-
-	err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid)
-	if err != nil {
+	var id int
+	switch v := uid.(type) {
+	case int:
+		id = v
+	case int64:
+		id = int(v)
+	default:
 		return User{}
 	}
 
+	u, _ := getUserByID(ctx, id)
 	return u
 }
 
@@ -186,11 +213,19 @@ func fetchUsers(ctx context.Context, idset map[int]struct{}) (map[int]User, erro
 	if len(idset) == 0 {
 		return m, nil
 	}
+	// キャッシュにあるものは即返し、無いものだけ1クエリでまとめて取得する。
 	args := make([]any, 0, len(idset))
 	ph := make([]string, 0, len(idset))
 	for id := range idset {
+		if v, ok := userCache.Load(id); ok {
+			m[id] = v.(User)
+			continue
+		}
 		args = append(args, id)
 		ph = append(ph, "?")
+	}
+	if len(args) == 0 {
+		return m, nil
 	}
 	var users []User
 	q := "SELECT * FROM `users` WHERE `id` IN (" + strings.Join(ph, ",") + ")"
@@ -199,39 +234,14 @@ func fetchUsers(ctx context.Context, idset map[int]struct{}) (map[int]User, erro
 	}
 	for _, u := range users {
 		m[u.ID] = u
-	}
-	return m, nil
-}
-
-// fetchCommentCounts は post_id ごとのコメント数を1クエリで取得する。
-func fetchCommentCounts(ctx context.Context, postIDs []int) (map[int]int, error) {
-	m := make(map[int]int, len(postIDs))
-	if len(postIDs) == 0 {
-		return m, nil
-	}
-	args := make([]any, len(postIDs))
-	ph := make([]string, len(postIDs))
-	for i, id := range postIDs {
-		args[i] = id
-		ph[i] = "?"
-	}
-	type countRow struct {
-		PostID int `db:"post_id"`
-		Cnt    int `db:"cnt"`
-	}
-	var rows []countRow
-	q := "SELECT `post_id`, COUNT(*) AS cnt FROM `comments` WHERE `post_id` IN (" + strings.Join(ph, ",") + ") GROUP BY `post_id`"
-	if err := db.SelectContext(ctx, &rows, q, args...); err != nil {
-		return nil, err
-	}
-	for _, r := range rows {
-		m[r.PostID] = r.Cnt
+		userCache.Store(u.ID, u)
 	}
 	return m, nil
 }
 
 // fetchComments は対象 post_id 群のコメントをまとめて取得し、投稿ごとに表示用に整える。
-// allComments=false の場合は各投稿の最新3件のみ。表示順は古い順。
+// allComments=false の場合は各投稿の最新3件のみ（window 関数で DB 側で絞り、
+// 取り過ぎを防ぐ）。表示順は古い順。
 func fetchComments(ctx context.Context, postIDs []int, allComments bool) (map[int][]Comment, error) {
 	res := make(map[int][]Comment, len(postIDs))
 	if len(postIDs) == 0 {
@@ -244,7 +254,15 @@ func fetchComments(ctx context.Context, postIDs []int, allComments bool) (map[in
 		ph[i] = "?"
 	}
 	var comments []Comment
-	q := "SELECT * FROM `comments` WHERE `post_id` IN (" + strings.Join(ph, ",") + ") ORDER BY `created_at` DESC, `id` DESC"
+	var q string
+	if allComments {
+		q = "SELECT `id`,`post_id`,`user_id`,`comment`,`created_at` FROM `comments` WHERE `post_id` IN (" + strings.Join(ph, ",") + ") ORDER BY `created_at` DESC, `id` DESC"
+	} else {
+		// 各 post_id ごとに新しい順で最大3件だけを DB 側で絞る。
+		q = "SELECT `id`,`post_id`,`user_id`,`comment`,`created_at` FROM (" +
+			"SELECT `id`,`post_id`,`user_id`,`comment`,`created_at`, ROW_NUMBER() OVER (PARTITION BY `post_id` ORDER BY `created_at` DESC, `id` DESC) AS rn " +
+			"FROM `comments` WHERE `post_id` IN (" + strings.Join(ph, ",") + ")) t WHERE t.rn <= 3 ORDER BY t.`created_at` DESC, t.`id` DESC"
+	}
 	if err := db.SelectContext(ctx, &comments, q, args...); err != nil {
 		return nil, err
 	}
@@ -310,17 +328,14 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		return []Post{}, nil
 	}
 
-	countMap, err := fetchCommentCounts(ctx, postIDs)
-	if err != nil {
-		return nil, err
-	}
+	// CommentCount は posts.comment_count（非正規化）から取得済みなので、
+	// ここではコメント本体だけまとめて取る。
 	commentsMap, err := fetchComments(ctx, postIDs, allComments)
 	if err != nil {
 		return nil, err
 	}
 
 	for i := range posts {
-		posts[i].CommentCount = countMap[posts[i].ID]
 		posts[i].Comments = commentsMap[posts[i].ID]
 	}
 
@@ -414,6 +429,11 @@ func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dbInitialize(ctx)
 	cleanupOrphanImages()
+	// dbInitialize が del_flg を作り直すため、ユーザキャッシュを破棄する。
+	userCache.Range(func(k, _ any) bool {
+		userCache.Delete(k)
+		return true
+	})
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -539,7 +559,9 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	// index for ORDER BY ... LIMIT (no temporary/filesort). makePosts then drops
 	// posts by deleted users and keeps the first postsPerPage; postsFetchMargin
 	// guarantees enough survivors. Bind the limit so it is reusable as a constant.
-	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsFetchMargin)
+	// FORCE INDEX: imgdata 削除でテーブルが小さくなった結果、optimizer が
+	// 全スキャン+filesort を誤って選ぶ。created_at index の backward scan を強制する。
+	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) ORDER BY `created_at` DESC LIMIT ?", postsFetchMargin)
 	if err != nil {
 		log.Print(err)
 		return
@@ -577,7 +599,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20", user.ID)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -596,33 +618,20 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	postIDs := []int{}
-	err = db.SelectContext(ctx, &postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
+	postCount := 0
+	err = db.GetContext(ctx, &postCount, "SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-	postCount := len(postIDs)
 
+	// そのユーザの投稿に付いたコメント総数。post_id を全取得して巨大 IN にする代わりに
+	// JOIN 一発で求める。
 	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []any
-		args := make([]any, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.GetContext(ctx, &commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
-			log.Print(err)
-			return
-		}
+	err = db.GetContext(ctx, &commentedCount, "SELECT COUNT(*) FROM `comments` c JOIN `posts` p ON c.`post_id` = p.`id` WHERE p.`user_id` = ?", user.ID)
+	if err != nil {
+		log.Print(err)
+		return
 	}
 
 	me := getSessionUser(r)
@@ -659,7 +668,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	results := []Post{}
 	// Single-table query (see getIndex): backward scan of posts(created_at) with
 	// LIMIT, then makePosts filters deleted users; postsFetchMargin over-fetches.
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsFetchMargin)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX(idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsFetchMargin)
 	if err != nil {
 		log.Print(err)
 		return
@@ -689,7 +698,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -774,13 +783,14 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	// 画像本体はファイルに書き出して nginx が配信するため DB には保存しない
+	// （imgdata カラムは削除済み）。
+	query := "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)"
 	result, err := db.ExecContext(
 		ctx,
 		query,
 		me.ID,
 		mime,
-		filedata,
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -801,38 +811,22 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-
-	post := Post{}
-	err = db.GetContext(ctx, &post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
 	ext := r.PathValue("ext")
 
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		// 次回以降は nginx が静的ファイルとして配信できるよう書き出しておく
-		writeImageFile(post.ID, post.Mime, post.Imgdata)
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
-		if err != nil {
-			log.Print(err)
-			return
-		}
+	// 画像はファイルとして保存され nginx が直接配信する。try_files の fallback で
+	// ここ(@app)に来るのはファイルが存在しない場合なので、あれば返し無ければ404。
+	p := "../public/image/" + strconv.Itoa(pid) + "." + ext
+	if _, err := os.Stat(p); err != nil {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-
-	w.WriteHeader(http.StatusNotFound)
+	http.ServeFile(w, r, p)
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
@@ -859,6 +853,11 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Print(err)
 		return
+	}
+
+	// 非正規化した comment_count を更新（GET に即時反映させる）。
+	if _, err := db.ExecContext(ctx, "UPDATE `posts` SET `comment_count` = `comment_count` + 1 WHERE `id` = ?", postID); err != nil {
+		log.Print(err)
 	}
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
@@ -919,6 +918,10 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range r.Form["uid[]"] {
 		db.ExecContext(ctx, query, 1, id)
+		// BAN で del_flg が変わるのでキャッシュを無効化する。
+		if n, err := strconv.Atoi(id); err == nil {
+			userCache.Delete(n)
+		}
 	}
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
