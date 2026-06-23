@@ -338,12 +338,21 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 	// HTML として持たせる。一覧用（最新3件）は memcached(GetMulti) からまとめて取得、
 	// 詳細用（全件）は DB から取得して都度描画する。
 	if allComments {
-		commentsMap, err := fetchComments(ctx, postIDs, true)
-		if err != nil {
-			return nil, err
-		}
+		// 詳細ページ（全コメント）の描画済み HTML も post 単位でキャッシュする。
 		for i := range posts {
-			posts[i].commentsHTML = renderCommentsSegment(commentsMap[posts[i].ID])
+			pid := posts[i].ID
+			key := "cdetail_" + strconv.Itoa(pid)
+			if it, gerr := memcacheClient.Get(key); gerr == nil {
+				posts[i].commentsHTML = string(it.Value)
+				continue
+			}
+			cm, ferr := fetchComments(ctx, []int{pid}, true)
+			if ferr != nil {
+				return nil, ferr
+			}
+			h := renderCommentsSegment(cm[pid])
+			posts[i].commentsHTML = h
+			memcacheClient.Set(&memcache.Item{Key: key, Value: []byte(h)})
 		}
 	} else {
 		htmlMap, err := commentsHTMLForPosts(ctx, postIDs)
@@ -996,8 +1005,9 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	if _, err := db.ExecContext(ctx, "UPDATE `posts` SET `comment_count` = `comment_count` + 1 WHERE `id` = ?", postID); err != nil {
 		log.Print(err)
 	}
-	// この投稿の描画済みコメント HTML キャッシュを無効化（次の取得で作り直す）。
+	// この投稿の描画済みコメント HTML キャッシュ（一覧用・詳細用）を無効化する。
 	memcacheClient.Delete("chtml_" + strconv.Itoa(postID))
+	memcacheClient.Delete("cdetail_" + strconv.Itoa(postID))
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
