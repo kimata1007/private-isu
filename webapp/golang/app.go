@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"io"
@@ -10,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
@@ -120,14 +121,10 @@ func escapeshellarg(arg string) string {
 }
 
 func digest(ctx context.Context, src string) string {
-	// opensslのバージョンによっては (stdin)= というのがつくので取る
-	out, err := exec.CommandContext(ctx, "/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
-	if err != nil {
-		log.Print(err)
-		return ""
-	}
-
-	return strings.TrimSuffix(string(out), "\n")
+	// 旧実装は openssl dgst -sha512 を外部プロセスで実行していたが、
+	// 出力が同一になるネイティブ sha512 に置換してプロセス起動コストを排除する。
+	sum := sha512.Sum512([]byte(src))
+	return hex.EncodeToString(sum[:])
 }
 
 func calculateSalt(ctx context.Context, accountName string) string {
@@ -175,68 +172,185 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
+// fetchUsers は指定 ID のユーザをまとめて1クエリで取得する。
+func fetchUsers(ctx context.Context, idset map[int]struct{}) (map[int]User, error) {
+	m := make(map[int]User, len(idset))
+	if len(idset) == 0 {
+		return m, nil
+	}
+	args := make([]any, 0, len(idset))
+	ph := make([]string, 0, len(idset))
+	for id := range idset {
+		args = append(args, id)
+		ph = append(ph, "?")
+	}
+	var users []User
+	q := "SELECT * FROM `users` WHERE `id` IN (" + strings.Join(ph, ",") + ")"
+	if err := db.SelectContext(ctx, &users, q, args...); err != nil {
+		return nil, err
+	}
+	for _, u := range users {
+		m[u.ID] = u
+	}
+	return m, nil
+}
+
+// fetchCommentCounts は post_id ごとのコメント数を1クエリで取得する。
+func fetchCommentCounts(ctx context.Context, postIDs []int) (map[int]int, error) {
+	m := make(map[int]int, len(postIDs))
+	if len(postIDs) == 0 {
+		return m, nil
+	}
+	args := make([]any, len(postIDs))
+	ph := make([]string, len(postIDs))
+	for i, id := range postIDs {
+		args[i] = id
+		ph[i] = "?"
+	}
+	type countRow struct {
+		PostID int `db:"post_id"`
+		Cnt    int `db:"cnt"`
+	}
+	var rows []countRow
+	q := "SELECT `post_id`, COUNT(*) AS cnt FROM `comments` WHERE `post_id` IN (" + strings.Join(ph, ",") + ") GROUP BY `post_id`"
+	if err := db.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		m[r.PostID] = r.Cnt
+	}
+	return m, nil
+}
+
+// fetchComments は対象 post_id 群のコメントをまとめて取得し、投稿ごとに表示用に整える。
+// allComments=false の場合は各投稿の最新3件のみ。表示順は古い順。
+func fetchComments(ctx context.Context, postIDs []int, allComments bool) (map[int][]Comment, error) {
+	res := make(map[int][]Comment, len(postIDs))
+	if len(postIDs) == 0 {
+		return res, nil
+	}
+	args := make([]any, len(postIDs))
+	ph := make([]string, len(postIDs))
+	for i, id := range postIDs {
+		args[i] = id
+		ph[i] = "?"
+	}
+	var comments []Comment
+	q := "SELECT * FROM `comments` WHERE `post_id` IN (" + strings.Join(ph, ",") + ") ORDER BY `created_at` DESC, `id` DESC"
+	if err := db.SelectContext(ctx, &comments, q, args...); err != nil {
+		return nil, err
+	}
+
+	uset := map[int]struct{}{}
+	for _, c := range comments {
+		uset[c.UserID] = struct{}{}
+	}
+	userMap, err := fetchUsers(ctx, uset)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, c := range comments {
+		if !allComments && len(res[c.PostID]) >= 3 {
+			continue
+		}
+		c.User = userMap[c.UserID]
+		res[c.PostID] = append(res[c.PostID], c)
+	}
+	// DESC で詰めたので古い順に反転
+	for pid, cs := range res {
+		for i, j := 0, len(cs)-1; i < j; i, j = i+1, j-1 {
+			cs[i], cs[j] = cs[j], cs[i]
+		}
+		res[pid] = cs
+	}
+	return res, nil
+}
+
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
 
+	// 投稿者ユーザをまとめて取得
+	uset := map[int]struct{}{}
 	for _, p := range results {
-		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
-		}
+		uset[p.UserID] = struct{}{}
+	}
+	userMap, err := fetchUsers(ctx, uset)
+	if err != nil {
+		return nil, err
+	}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
+	// del_flg=0 のユーザの投稿のみ、最大 postsPerPage 件を採用
+	posts := make([]Post, 0, postsPerPage)
+	postIDs := make([]int, 0, postsPerPage)
+	for _, p := range results {
+		u, ok := userMap[p.UserID]
+		if !ok || u.DelFlg != 0 {
+			continue
 		}
-		var comments []Comment
-		err = db.SelectContext(ctx, &comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := range comments {
-			err := db.GetContext(ctx, &comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.GetContext(ctx, &p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
+		p.User = u
 		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
+		posts = append(posts, p)
+		postIDs = append(postIDs, p.ID)
 		if len(posts) >= postsPerPage {
 			break
 		}
+	}
+	if len(posts) == 0 {
+		return []Post{}, nil
+	}
+
+	countMap, err := fetchCommentCounts(ctx, postIDs)
+	if err != nil {
+		return nil, err
+	}
+	commentsMap, err := fetchComments(ctx, postIDs, allComments)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range posts {
+		posts[i].CommentCount = countMap[posts[i].ID]
+		posts[i].Comments = commentsMap[posts[i].ID]
 	}
 
 	return posts, nil
 }
 
-func imageURL(p Post) string {
-	ext := ""
-	if p.Mime == "image/jpeg" {
-		ext = ".jpg"
-	} else if p.Mime == "image/png" {
-		ext = ".png"
-	} else if p.Mime == "image/gif" {
-		ext = ".gif"
+func imageExt(mime string) string {
+	switch mime {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
 	}
+	return ""
+}
 
-	return "/image/" + strconv.Itoa(p.ID) + ext
+func imageURL(p Post) string {
+	return "/image/" + strconv.Itoa(p.ID) + imageExt(p.Mime)
+}
+
+// 画像を public/image 配下にファイルとして書き出す（nginx が静的配信できるようにする）。
+// 一時ファイルに書いてから rename することで、配信中の半端なファイルを避ける。
+func writeImageFile(id int, mime string, data []byte) {
+	ext := imageExt(mime)
+	if ext == "" {
+		return
+	}
+	dst := "../public/image/" + strconv.Itoa(id) + ext
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		log.Print(err)
+		return
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		log.Print(err)
+	}
 }
 
 func isLogin(u User) bool {
@@ -567,7 +681,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -680,6 +794,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// アップロード時点でファイルにも書き出し、GET /image を nginx 静的配信に乗せる
+	writeImageFile(int(pid), mime, filedata)
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -704,6 +821,8 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
+		// 次回以降は nginx が静的ファイルとして配信できるよう書き出しておく
+		writeImageFile(post.ID, post.Mime, post.Imgdata)
 		w.Header().Set("Content-Type", post.Mime)
 		_, err := w.Write(post.Imgdata)
 		if err != nil {
@@ -842,6 +961,7 @@ func main() {
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.Local
+	cfg.InterpolateParams = true
 	dsn := cfg.FormatDSN()
 
 	db, err = sqlx.Open("mysql", dsn)
@@ -849,6 +969,11 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	// 2 vCPU の MySQL に対して接続が殺到するとタイムアウトするため上限を設ける
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(20)
+	db.SetConnMaxLifetime(0)
 
 	r := chi.NewRouter()
 
